@@ -1,0 +1,325 @@
+# Create the Shadowscribe app project structure and zip it for the user.
+import os, json, textwrap, zipfile, pathlib
+
+base = "/mnt/data/shadowscribe_app"
+frontend = os.path.join(base, "frontend")
+worker = os.path.join(base, "worker")
+
+os.makedirs(frontend, exist_ok=True)
+os.makedirs(worker, exist_ok=True)
+
+# --- Worker code (Cloudflare Worker) ---
+worker_js = r'''export default {
+  async fetch(request, env) {
+    const cors = {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "POST, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization"
+    };
+
+    if (request.method === "OPTIONS") {
+      return new Response(null, { headers: cors });
+    }
+    if (request.method !== "POST") {
+      return new Response("Method Not Allowed", { status: 405, headers: cors });
+    }
+
+    let payload;
+    try {
+      payload = await request.json();
+    } catch (e) {
+      return new Response(JSON.stringify({ error: { message: "Invalid JSON" } }), {
+        status: 400,
+        headers: { ...cors, "Content-Type": "application/json" }
+      });
+    }
+
+    const model = payload.model || "gpt-4o-mini";
+    const system = payload.system ? [{ role: "system", content: payload.system }] : [];
+    const messages = Array.isArray(payload.messages) ? payload.messages : [];
+    const temperature = typeof payload.temperature === "number" ? payload.temperature : 0.7;
+
+    const body = {
+      model,
+      temperature,
+      messages: [...system, ...messages]
+    };
+
+    const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${env.OPENAI_API_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(body)
+    });
+
+    const text = await resp.text();
+    return new Response(text, {
+      status: resp.status,
+      headers: { ...cors, "Content-Type": "application/json" }
+    });
+  }
+};'''
+
+with open(os.path.join(worker, "worker.js"), "w") as f:
+    f.write(worker_js)
+
+with open(os.path.join(worker, "README-worker.txt"), "w") as f:
+    f.write(textwrap.dedent("""\
+    Cloudflare Worker for Shadowscribe
+    ==================================
+
+    1) Go to https://dash.cloudflare.com → Workers & Pages → Create Worker → Quick Edit.
+    2) Paste the contents of worker.js into the editor and Deploy.
+    3) Settings → Variables → Add variable:
+         Name: OPENAI_API_KEY
+         Value: YOUR_OPENAI_API_KEY
+    4) Copy the Worker URL (ends with .workers.dev). You'll paste it into the app Settings.
+    """))
+
+# --- Frontend files ---
+index_html = r'''<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Shadowscribe</title>
+  <link rel="manifest" href="/manifest.json" />
+  <style>
+    :root{--b:#0b0b0f;--c:#e8e8ea;--p:#14141b;--bd:#23232e}
+    html,body{height:100%}
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,"Helvetica Neue",sans-serif;margin:0;background:var(--b);color:var(--c)}
+    .wrap{max-width:860px;margin:0 auto;padding:16px}
+    .card{background:var(--p);border:1px solid var(--bd);border-radius:16px;box-shadow:0 6px 24px rgba(0,0,0,.35);padding:16px}
+    .row{display:flex;gap:8px}
+    .input{flex:1;background:#0f0f15;color:var(--c);border:1px solid #2a2a36;border-radius:12px;padding:12px}
+    .btn{background:#4f46e5;border:none;color:white;border-radius:12px;padding:12px 16px;font-weight:600}
+    .btn:disabled{opacity:.6}
+    .pill{display:inline-flex;gap:8px;background:#1b1b25;border:1px solid #2a2a36;border-radius:999px;padding:8px 12px;margin:4px 4px 12px 0}
+    .msg{white-space:pre-wrap;background:#0f0f15;border:1px solid #22232d;border-radius:12px;padding:12px;margin:8px 0}
+    .you{background:#10131a}
+    .ai{background:#0f1116}
+    small{opacity:.7}
+    .settings{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:8px}
+    select, input[type="text"]{background:#0f0f15;color:var(--c);border:1px solid #2a2a36;border-radius:12px;padding:8px}
+    label{font-size:12px;opacity:.8}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Shadowscribe</h1>
+    <div class="card" id="app">
+      <div class="settings">
+        <div class="pill">
+          <label for="connection">Connection:</label>
+          <select id="connection">
+            <option value="worker" selected>Worker (recommended)</option>
+            <option value="direct">Direct OpenAI (local key)</option>
+          </select>
+        </div>
+        <div class="pill" id="workerWrap">
+          <label for="workerUrl">Worker URL:</label>
+          <input id="workerUrl" placeholder="https://your-worker.workers.dev" />
+        </div>
+        <div class="pill" id="keyWrap" style="display:none">
+          <label for="apiKey">OpenAI Key:</label>
+          <input type="text" id="apiKey" placeholder="sk-..." />
+        </div>
+        <div class="pill">
+          <label for="mode">Mode:</label>
+          <select id="mode">
+            <option value="Lore">Lore</option>
+            <option value="Bio">Bio</option>
+            <option value="Scene">Scene</option>
+            <option value="Magic">Magic</option>
+            <option value="Outline">Outline</option>
+          </select>
+        </div>
+        <div class="pill">
+          <label for="model">Model:</label>
+          <select id="model">
+            <option>gpt-4o-mini</option>
+            <option>gpt-4o</option>
+            <option>gpt-4.1-mini</option>
+          </select>
+        </div>
+        <div class="pill">
+          <label for="temp">Creativity:</label>
+          <input id="temp" type="range" min="0" max="1" step="0.1" value="0.7"/>
+          <small id="tval">0.7</small>
+        </div>
+      </div>
+
+      <div id="log"></div>
+
+      <div class="row" style="margin-top:12px;">
+        <input id="prompt" class="input" placeholder="Ask Shadowscribe…" />
+        <button id="send" class="btn">Send</button>
+      </div>
+      <small>Tip: Chrome on Android → ⋮ → Add to Home screen to install.</small>
+    </div>
+  </div>
+
+  <script>
+    const el = (id)=>document.getElementById(id);
+    const log = el('log');
+    const messages = JSON.parse(localStorage.getItem('ss_chat')||'[]');
+    const connection = el('connection');
+    const workerWrap = el('workerWrap');
+    const keyWrap = el('keyWrap');
+    const workerUrl = el('workerUrl');
+    const apiKey = el('apiKey');
+    const model = el('model');
+    const temp = el('temp');
+    const tval = el('tval');
+    const mode = el('mode');
+    const promptEl = el('prompt');
+    const sendBtn = el('send');
+
+    // restore settings
+    (function init(){
+      const saved = JSON.parse(localStorage.getItem('ss_settings')||'{}');
+      if(saved.connection) connection.value = saved.connection;
+      if(saved.workerUrl) workerUrl.value = saved.workerUrl;
+      if(saved.apiKey) apiKey.value = saved.apiKey;
+      if(saved.model) model.value = saved.model;
+      if(saved.temp!==undefined) temp.value = saved.temp, tval.textContent = saved.temp;
+      if(saved.mode) mode.value = saved.mode;
+      toggleConn();
+      render();
+    })();
+
+    function saveSettings(){
+      localStorage.setItem('ss_settings', JSON.stringify({
+        connection: connection.value,
+        workerUrl: workerUrl.value.trim(),
+        apiKey: apiKey.value.trim(),
+        model: model.value,
+        temp: parseFloat(temp.value),
+        mode: mode.value
+      }));
+    }
+    connection.addEventListener('change', ()=>{ toggleConn(); saveSettings(); });
+    workerUrl.addEventListener('input', saveSettings);
+    apiKey.addEventListener('input', saveSettings);
+    model.addEventListener('change', saveSettings);
+    temp.addEventListener('input', ()=>{ tval.textContent = temp.value; saveSettings(); });
+    mode.addEventListener('change', saveSettings);
+
+    function toggleConn(){
+      const isWorker = connection.value === 'worker';
+      workerWrap.style.display = isWorker ? '' : 'none';
+      keyWrap.style.display = isWorker ? 'none' : '';
+    }
+
+    function render(){
+      log.innerHTML = messages.map(m=>`<div class="msg ${m.role==='user'?'you':'ai'}"><b>${m.role==='user'?'You':'Shadowscribe'}</b><br>${escapeHtml(m.content)}</div>`).join('');
+      localStorage.setItem('ss_chat', JSON.stringify(messages));
+    }
+
+    function escapeHtml(s){ return s.replace(/[&<>\\"]+/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+    async function send(){
+      const text = promptEl.value.trim();
+      if(!text) return;
+      const creativity = parseFloat(temp.value);
+
+      const system = "You are Shadowscribe, Achilles' grimdark writing engine. Mode="+mode.value+". Maintain Drakari canon, avoid clichés, structure output when useful, and keep responses concise unless asked to expand.";
+
+      messages.push({ role: 'user', content: text });
+      render();
+      promptEl.value=''; sendBtn.disabled = true;
+
+      try {
+        let url, headers;
+        if (connection.value === 'worker') {
+          url = workerUrl.value.trim();
+          if(!url){ throw new Error('Set your Worker URL in Settings.'); }
+          headers = { 'Content-Type': 'application/json' };
+        } else {
+          url = 'https://api.openai.com/v1/chat/completions';
+          if(!apiKey.value.trim()){ throw new Error('Paste your OpenAI API key in Settings.'); }
+          headers = { 'Content-Type': 'application/json', 'Authorization': 'Bearer '+apiKey.value.trim() };
+        }
+        const body = JSON.stringify({ model: model.value, temperature: creativity, system, messages });
+        const res = await fetch(url, { method:'POST', headers, body });
+        const data = await res.json();
+        const reply = (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || (data.error ? ('⚠️ '+(data.error.message||'Error')) : JSON.stringify(data));
+        messages.push({ role:'assistant', content: reply });
+      } catch (e) {
+        messages.push({ role:'assistant', content: '⚠️ '+(e.message||'Network error') });
+      } finally {
+        sendBtn.disabled = false;
+        render();
+      }
+    }
+    sendBtn.addEventListener('click', send);
+    promptEl.addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.preventDefault(); send(); } });
+  </script>
+
+  <script>
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', ()=> navigator.serviceWorker.register('/sw.js'));
+    }
+  </script>
+</body>
+</html>
+'''
+
+manifest_json = {
+  "name": "Shadowscribe",
+  "short_name": "Shadowscribe",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0b0b0f",
+  "theme_color": "#0b0b0f",
+  "icons": []
+}
+
+sw_js = r'''self.addEventListener('install', e=>{
+  e.waitUntil(caches.open('ss-cache').then(c=>c.addAll(['/','/index.html','/manifest.json'])));
+});
+self.addEventListener('fetch', e=>{
+  e.respondWith(caches.match(e.request).then(r=> r || fetch(e.request)));
+});'''
+
+with open(os.path.join(frontend, "index.html"), "w", encoding="utf-8") as f:
+    f.write(index_html)
+
+with open(os.path.join(frontend, "manifest.json"), "w", encoding="utf-8") as f:
+    json.dump(manifest_json, f, indent=2)
+
+with open(os.path.join(frontend, "sw.js"), "w", encoding="utf-8") as f:
+    f.write(sw_js)
+
+with open(os.path.join(frontend, "README-frontend.txt"), "w") as f:
+    f.write(textwrap.dedent("""\
+    Shadowscribe Frontend (PWA)
+    ===========================
+    Files:
+      - index.html   (the app)
+      - manifest.json
+      - sw.js        (service worker so Android can 'Add to Home screen')
+
+    Quick hosting options:
+      A) Netlify: New site → Deploy manually → drag this /frontend folder.
+      B) Cloudflare Pages: Create project → Upload → select /frontend folder.
+      C) Any static host will work; must be HTTPS for the PWA install.
+
+    First run:
+      1) Open the site on your phone.
+      2) Tap Settings → choose 'Worker' and paste your Workers URL, or choose 'Direct OpenAI' and paste your key (stored locally).
+      3) Add to Home screen from Chrome's ⋮ menu to install.
+    """))
+
+# Zip everything
+zip_path = "/mnt/data/shadowscribe_app.zip"
+with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as z:
+    for root, dirs, files in os.walk(base):
+        for name in files:
+            full = os.path.join(root, name)
+            rel = os.path.relpath(full, base)
+            z.write(full, rel)
+
+zip_path
